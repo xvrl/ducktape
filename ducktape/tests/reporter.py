@@ -19,7 +19,9 @@ import shutil
 import pkg_resources
 
 from ducktape.utils.terminal_size import get_terminal_size
-from ducktape.tests.result import PASS, FAIL, IGNORE
+from ducktape.utils.util import ducktape_version
+from ducktape.tests.status import PASS, FAIL, IGNORE
+from ducktape.json_serializable import DucktapeJSONEncoder
 
 
 DEFAULT_SEPARATOR_WIDTH = 100
@@ -51,7 +53,7 @@ class SingleResultReporter(object):
         result_lines = [
             "test_id:    %s" % self.result.test_id,
             "status:     %s" % str(self.result.test_status).upper(),
-            "run time:   %s" % format_time(self.result.run_time),
+            "run time:   %s" % format_time(self.result.run_time_seconds),
         ]
 
         if self.result.test_status == FAIL:
@@ -99,12 +101,13 @@ class SimpleSummaryReporter(SummaryReporter):
         header_lines = [
             "=" * self.width,
             "SESSION REPORT (ALL TESTS)",
-            "session_id: %s" % self.results.session_context.session_id,
-            "run time:   %s" % format_time(self.results.run_time),
-            "tests run:  %d" % len(self.results),
-            "passed:     %d" % self.results.num_passed,
-            "failed:     %d" % self.results.num_failed,
-            "ignored:    %d" % self.results.num_ignored,
+            "ducktape version: %s" % ducktape_version(),
+            "session_id:       %s" % self.results.session_context.session_id,
+            "run time:         %s" % format_time(self.results.run_time_seconds),
+            "tests run:        %d" % len(self.results),
+            "passed:           %d" % self.results.num_passed,
+            "failed:           %d" % self.results.num_failed,
+            "ignored:          %d" % self.results.num_ignored,
             "=" * self.width
         ]
 
@@ -134,6 +137,16 @@ class SimpleStdoutSummaryReporter(SimpleSummaryReporter):
         print self.report_string()
 
 
+class JSONReporter(object):
+    def __init__(self, results):
+        self.results = results
+
+    def report(self):
+        report_file = os.path.abspath(os.path.join(self.results.session_context.results_dir, "report.json"))
+        with open(report_file, "w") as f:
+            f.write(json.dumps(self.results, cls=DucktapeJSONEncoder, sort_keys=True, indent=2, separators=(',', ': ')))
+
+
 class HTMLSummaryReporter(SummaryReporter):
 
     def format_test_name(self, result):
@@ -155,7 +168,7 @@ class HTMLSummaryReporter(SummaryReporter):
             "test_name": self.format_test_name(result),
             "test_result": test_result,
             "description": result.description,
-            "run_time": format_time(result.run_time),
+            "run_time": format_time(result.run_time_seconds),
             "data": "" if result.data is None else json.dumps(result.data, sort_keys=True, indent=2, separators=(',', ': ')),
             "test_log": self.test_results_dir(result)
         }
@@ -186,11 +199,12 @@ class HTMLSummaryReporter(SummaryReporter):
             result_string += ","
 
         args = {
+            'ducktape_version': ducktape_version(),
             'num_tests': num_tests,
             'num_passes': self.results.num_passed,
             'num_failures': self.results.num_failed,
             'num_ignored': self.results.num_ignored,
-            'run_time': format_time(self.results.run_time),
+            'run_time': format_time(self.results.run_time_seconds),
             'session': self.results.session_context.session_id,
             'tests': result_string,
             'test_status_names': ",".join(["\'%s\'" % str(status) for status in [PASS, FAIL, IGNORE]])

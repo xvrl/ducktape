@@ -12,16 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
+from collections import namedtuple
+import copy
 import logging
 import multiprocessing
 import os
+import pysistence
 import signal
 import time
 import traceback
 import zmq
 
 from ducktape.tests.serde import SerDe
+from ducktape.tests.test import TestContext
 from ducktape.command_line.defaults import ConsoleDefaults
 from ducktape.tests.runner_client import run_client
 from ducktape.tests.result import TestResults
@@ -30,6 +33,7 @@ from ducktape.tests.event import ClientEventFactory, EventResponseFactory
 from ducktape.cluster.finite_subcluster import FiniteSubcluster
 from ducktape.tests.scheduler import TestScheduler
 from ducktape.tests.result import FAIL, TestResult
+from ducktape.tests.reporter import SimpleFileSummaryReporter, HTMLSummaryReporter, JSONReporter
 
 
 class Receiver(object):
@@ -64,6 +68,9 @@ class Receiver(object):
         self.socket.close()
 
 
+TestKey = namedtuple('TestKey', ['test_id', 'test_index'])
+
+
 class TestRunner(object):
 
     # When set to True, the test runner will finish running/cleaning the current test, but it will not run any more
@@ -88,7 +95,7 @@ class TestRunner(object):
 
         self.session_context = session_context
         self.max_parallel = session_context.max_parallel
-        self.results = TestResults(self.session_context)
+        self.results = TestResults(self.session_context, self.cluster)
 
         self.exit_first = self.session_context.exit_first
 
@@ -97,8 +104,9 @@ class TestRunner(object):
 
         self.test_counter = 1
         self.total_tests = len(self.scheduler)
-        self._test_context = {t.test_id: t for t in tests}
-        self._test_cluster = {}  # Track subcluster assigned to a particular test_id
+        # This immutable dict tracks test_id -> test_context
+        self._test_context = pysistence.make_dict(**{t.test_id: t for t in tests})
+        self._test_cluster = {}  # Track subcluster assigned to a particular TestKey
         self._client_procs = {}  # track client processes running tests
         self.active_tests = {}
         self.finished_tests = {}
@@ -158,13 +166,18 @@ class TestRunner(object):
                 msg += "expected_num_nodes: %s, cluster size: %s." % (str(tc.expected_num_nodes), str(len(self.cluster)))
                 self._log(logging.ERROR, msg)
 
-                self.results.append(TestResult(
+                result = TestResult(
                     tc,
+                    self.test_counter,
                     self.session_context,
                     test_status=FAIL,
                     summary=msg,
                     start_time=time.time(),
-                    stop_time=time.time()))
+                    stop_time=time.time())
+                self.results.append(result)
+                result.report()
+
+                self.test_counter += 1
 
         # Run the tests!
         self._log(logging.INFO, "starting test run with session id %s..." % self.session_context.session_id)
@@ -201,11 +214,13 @@ class TestRunner(object):
 
     def _run_single_test(self, test_context):
         """Start a test runner client in a subprocess"""
-        self._log(logging.INFO, "Triggering test %d of %d..." % (self.test_counter, self.total_tests))
+        current_test_counter = self.test_counter
         self.test_counter += 1
+        self._log(logging.INFO, "Triggering test %d of %d..." % (current_test_counter, self.total_tests))
 
         # Test is considered "active" as soon as we start it up in a subprocess
-        self.active_tests[test_context.test_id] = True
+        test_key = TestKey(test_context.test_id, current_test_counter)
+        self.active_tests[test_key] = True
 
         proc = multiprocessing.Process(
             target=run_client,
@@ -213,12 +228,13 @@ class TestRunner(object):
                 self.hostname,
                 self.receiver.port,
                 test_context.test_id,
-                test_context.logger_name,
-                test_context.results_dir,
+                current_test_counter,
+                TestContext.logger_name(test_context, current_test_counter),
+                TestContext.results_dir(test_context, current_test_counter),
                 self.session_context.debug
             ])
 
-        self._client_procs[test_context.test_id] = proc
+        self._client_procs[test_key] = proc
         proc.start()
 
     def _preallocate_subcluster(self, test_context):
@@ -236,7 +252,7 @@ class TestRunner(object):
                       "Test %s is using entire cluster. It's possible this test has no associated cluster metadata."
                       % test_context.test_id)
 
-        self._test_cluster[test_context.test_id] = FiniteSubcluster(self.cluster.alloc(test_context.expected_num_nodes))
+        self._test_cluster[TestKey(test_context.test_id, self.test_counter)] = FiniteSubcluster(self.cluster.alloc(test_context.expected_num_nodes))
 
     def _handle(self, event):
         self._log(logging.DEBUG, str(event))
@@ -253,9 +269,10 @@ class TestRunner(object):
             raise RuntimeError("Received event with unknown event type: " + str(event))
 
     def _handle_ready(self, event):
-        test_id = event["test_id"]
-        test_context = self._test_context[test_id]
-        subcluster = self._test_cluster[test_id]
+        test_key = TestKey(event["test_id"], event["test_index"])
+        test_context = self._test_context[event["test_id"]]
+        subcluster = self._test_cluster[test_key]
+
         self.receiver.send(
                 self.event_response.ready(event, self.session_context, test_context, subcluster))
 
@@ -264,7 +281,7 @@ class TestRunner(object):
         self._log(event["log_level"], event["message"])
 
     def _handle_finished(self, event):
-        test_id = event["test_id"]
+        test_key = TestKey(event["test_id"], event["test_index"])
         self.receiver.send(self.event_response.finished(event))
 
         result = event['result']
@@ -272,17 +289,28 @@ class TestRunner(object):
             self.stop_testing = True
 
         # Transition this test from running to finished
-        del self.active_tests[test_id]
-        self.finished_tests[test_id] = event
+        del self.active_tests[test_key]
+        self.finished_tests[test_key] = event
         self.results.append(result)
 
         # Free nodes used by the test
-        subcluster = self._test_cluster[test_id]
+        subcluster = self._test_cluster[test_key]
         self.cluster.free(subcluster.alloc(len(subcluster)))
-        del self._test_cluster[test_id]
+        del self._test_cluster[test_key]
 
         # Join on the finished test process
-        self._client_procs[test_id].join()
+        self._client_procs[test_key].join()
+
+        # Report partial result summaries - it is helpful to have partial test reports available if the
+        # ducktape process is killed with a SIGKILL partway through
+        test_results = copy.copy(self.results)  # shallow copy
+        reporters = [
+            SimpleFileSummaryReporter(test_results),
+            HTMLSummaryReporter(test_results),
+            JSONReporter(test_results)
+        ]
+        for r in reporters:
+            r.report()
 
         if self._should_print_separator:
             terminal_width, y = get_terminal_size()

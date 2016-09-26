@@ -44,6 +44,9 @@ class SessionContext(object):
         """None, or an immutable dictionary containing user-defined global variables."""
         return self._globals
 
+    def to_json(self):
+        return self.__dict__
+
 
 class SessionLoggerMaker(LoggerMaker):
     def __init__(self, session_context):

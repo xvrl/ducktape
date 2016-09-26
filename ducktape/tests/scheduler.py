@@ -63,6 +63,8 @@ class TestScheduler(object):
         """Get the next test.
 
         This action removes the test_context object from the scheduler.
+
+        :return test_context object
         """
         if len(self) == 0:
             raise StopIteration("Scheduler is empty.")

@@ -24,7 +24,8 @@ from ducktape.command_line.defaults import ConsoleDefaults
 from ducktape.command_line.parse_args import parse_args
 from ducktape.tests.loader import TestLoader, LoaderException
 from ducktape.tests.loggermaker import close_logger
-from ducktape.tests.reporter import SimpleStdoutSummaryReporter, SimpleFileSummaryReporter, HTMLSummaryReporter
+from ducktape.tests.reporter import SimpleStdoutSummaryReporter, SimpleFileSummaryReporter, \
+    HTMLSummaryReporter, JSONReporter
 from ducktape.tests.runner import TestRunner
 from ducktape.tests.session import SessionContext, SessionLoggerMaker
 from ducktape.tests.session import generate_session_id, generate_results_dir
@@ -145,7 +146,7 @@ def main():
 
     # Discover and load tests to be run
     extend_import_paths(args_dict["test_path"])
-    loader = TestLoader(session_context, session_logger, injected_args=injected_args)
+    loader = TestLoader(session_context, session_logger, repeat=args_dict["repeat"], injected_args=injected_args)
     try:
         tests = loader.load(args_dict["test_path"])
     except LoaderException as e:
@@ -179,16 +180,18 @@ def main():
     test_results = runner.run_all_tests()
 
     # Report results
-    reporter = SimpleStdoutSummaryReporter(test_results)
-    reporter.report()
-    reporter = SimpleFileSummaryReporter(test_results)
-    reporter.report()
+    reporters = [
+        SimpleStdoutSummaryReporter(test_results),
+        SimpleFileSummaryReporter(test_results),
+        HTMLSummaryReporter(test_results),
+        JSONReporter(test_results)
+    ]
 
-    # Generate HTML reporter
-    reporter = HTMLSummaryReporter(test_results)
-    reporter.report()
+    for r in reporters:
+        r.report()
 
     update_latest_symlink(args_dict["results_root"], results_dir)
     close_logger(session_logger)
     if not test_results.get_aggregate_success():
+        # Non-zero exit if at least one test failed
         sys.exit(1)

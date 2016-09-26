@@ -22,22 +22,21 @@ import zmq
 from ducktape.tests.event import ClientEventFactory
 from ducktape.tests.loader import TestLoader
 from ducktape.tests.serde import SerDe
-from ducktape.tests.test import test_logger
+from ducktape.tests.test import test_logger, TestContext
 
 from ducktape.tests.result import TestResult, IGNORE, PASS, FAIL
-from ducktape.tests.reporter import SingleResultFileReporter
 from ducktape.utils.local_filesystem_utils import mkdir_p
 
 
-def run_client(server_hostname, server_port, logger_name, test_id, log_dir, debug):
-    client = RunnerClient(server_hostname, server_port, test_id, logger_name, log_dir, debug)
+def run_client(server_hostname, server_port, test_id, test_index, logger_name, log_dir, debug):
+    client = RunnerClient(server_hostname, server_port, test_id, test_index, logger_name, log_dir, debug)
     client.run()
 
 
 class RunnerClient(object):
     """Run a single test"""
 
-    def __init__(self, server_hostname, server_port, test_id, logger_name, log_dir, debug):
+    def __init__(self, server_hostname, server_port, test_id, test_index, logger_name, log_dir, debug):
         signal.signal(signal.SIGTERM, self._sigterm_handler)  # register a SIGTERM handler
 
         self.serde = SerDe()
@@ -45,8 +44,9 @@ class RunnerClient(object):
         self.runner_port = server_port
 
         self.test_id = test_id
+        self.test_index = test_index
         self.id = "test-runner-%d-%d" % (os.getpid(), id(self))
-        self.message = ClientEventFactory(self.test_id, self.id)
+        self.message = ClientEventFactory(self.test_id, self.test_index, self.id)
         self.sender = Sender(server_hostname, str(self.runner_port), self.message, self.logger)
 
         ready_reply = self.sender.send(self.message.ready())
@@ -80,21 +80,24 @@ class RunnerClient(object):
     def run(self):
         self.log(logging.INFO, "Loading test %s" % str(self.test_metadata))
         self.test_context = self._collect_test_context(**self.test_metadata)
+        self.test_context.test_index = self.test_index
 
         self.send(self.message.running())
         if self.test_context.ignore:
             # Skip running this test, but keep track of the fact that we ignored it
             result = TestResult(self.test_context,
+                                self.test_index,
                                 self.session_context,
                                 test_status=IGNORE,
                                 start_time=time.time(),
                                 stop_time=time.time())
+            result.report()
             # Tell the server we are finished
             self.send(self.message.finished(result=result))
             return
 
         # Results from this test, as well as logs will be dumped here
-        mkdir_p(self.test_context.results_dir)
+        mkdir_p(TestContext.results_dir(self.test_context, self.test_index))
 
         start_time = -1
         stop_time = -1
@@ -136,6 +139,7 @@ class RunnerClient(object):
 
             result = TestResult(
                 self.test_context,
+                self.test_index,
                 self.session_context,
                 test_status,
                 summary,
@@ -146,11 +150,16 @@ class RunnerClient(object):
             self.log(logging.INFO, "Summary: %s" % str(result.summary))
             self.log(logging.INFO, "Data: %s" % str(result.data))
 
-            test_reporter = SingleResultFileReporter(result)
-            test_reporter.report()
+            result.report()
 
         # Tell the server we are finished
         self._do_safely(lambda: self.send(self.message.finished(result=result)), "Problem sending FINISHED message:")
+
+        # Release test_context resources only after creating the result and finishing logging activity
+        # The Sender object uses the same logger, so we postpone closing until after the finished message is sent
+        self.test_context.close()
+        self.test_context = None
+        self.test = None
 
     def setup_test(self):
         """start services etc"""
@@ -200,7 +209,6 @@ class RunnerClient(object):
             self._do_safely(services.clean_all, "Error cleaning services:")
 
         self._do_safely(self.test.free_nodes, "Error freeing nodes:")
-        self.test_context.close()
 
     def log(self, log_level, msg, *args, **kwargs):
         """Log to the service log and the test log of the current test."""
